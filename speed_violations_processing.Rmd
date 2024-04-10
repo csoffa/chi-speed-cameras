@@ -1,0 +1,155 @@
+---
+title: "speed_cameras_processing"
+author: "Cole Soffa"
+date: "November 1, 2018"
+output: html_document
+---
+
+
+```{r, include = FALSE}
+
+library(readr)
+library(ggmap)
+library(ggplot2)
+library(dplyr)
+
+```
+
+Read in the speed camera violations dataset from Chicago data portal: https://data.cityofchicago.org/Transportation/Speed-Camera-Violations/hhkd-xvj4
+```{r, results = FALSE}
+speed_violations <- read_csv("speed_camera_violations.csv")
+```
+
+The dataset contains `r nrow(speed_violations)` days of speed violations.
+
+Cleaning up column names and dropping unused columns. The location column seems to be a duplicate of the latitude/longitude columns.
+```{r}
+speed_violations$LOCATION = NULL
+speed_violations$Date <- speed_violations$`VIOLATION DATE`
+speed_violations$`VIOLATION DATE`= NULL
+speed_violations$Camera <- speed_violations$`CAMERA ID`
+speed_violations$`CAMERA ID`<- NULL
+
+```
+
+```{r, include = FALSE}
+View(speed_violations)
+```
+
+
+Creating separate columns for Month_Day and Year so we may group by them individually. Selecting columns in order I would like to work with them.
+```{r, cache = TRUE}
+speed_violations <- mutate(speed_violations, Year = substr(Date, 1, 4))
+speed_violations <- mutate(speed_violations, Month_Day = substr(Date, 6, 10))
+speed_violations <- select(speed_violations, Camera, ADDRESS, VIOLATIONS, LATITUDE, LONGITUDE, Date, Month_Day, Year)
+
+head(speed_violations)
+
+```
+```{r}
+length(unique(speed_violations$Camera))
+min(speed_violations$Date)
+max(speed_violations$Date)
+min(speed_violations$VIOLATIONS)
+max(speed_violations$VIOLATIONS)
+```
+```{r}
+ggplot(speed_violations, aes(x=Date, y=VIOLATIONS))+
+  geom_point(alpha=0.25, colour = 'coral2')
+```
+
+
+Some latitude and longitude values are null for our speed cameras. I found which ones are null so we may fill in missing coordinates.
+```{r}
+missing_coordinates <- speed_violations %>%
+  group_by(Camera) %>%
+  summarise(
+    na_latitude = sum(is.na(LATITUDE)),
+    na_longitude = sum(is.na(LONGITUDE))
+  ) %>%
+  filter(na_latitude > 0)
+
+```
+There were `r nrow(missing_coordinates)` cameras without coordinates.
+
+
+I manually input coordinates for the cameras that did not have latitude/longitudes.
+```{r, cache = TRUE}
+speed_violations <- speed_violations %>%
+  mutate(LATITUDE = ifelse(Camera == 'CHI010', 41.902780, LATITUDE)) %>%
+  mutate(LONGITUDE = ifelse(Camera == 'CHI010', -87.702270, LONGITUDE))%>%
+  mutate(LATITUDE = ifelse(Camera == 'CHI064', 41.752490, LATITUDE))%>%
+  mutate(LONGITUDE = ifelse(Camera == 'CHI064', -87.682420, LONGITUDE))%>%
+  mutate(LATITUDE = ifelse(Camera == 'CHI065', 41.978870, LATITUDE)) %>%
+  mutate(LONGITUDE = ifelse(Camera == 'CHI065', -87.820824, LONGITUDE)) %>%
+  mutate(LATITUDE = ifelse(Camera == 'CHI068', 41.792122, LATITUDE)) %>%
+  mutate(LONGITUDE = ifelse(Camera == 'CHI068', -87.732491, LONGITUDE)) %>%
+  mutate(LATITUDE = ifelse(Camera == 'CHI069', 41.792310, LATITUDE)) %>%
+  mutate(LONGITUDE = ifelse(Camera == 'CHI069', -87.733170, LONGITUDE))
+
+```
+
+Adding in whether each date is a holiday or not. I would like to eventually explore if there are any trends in speed camera violations and holidays.
+```{r, cache = TRUE}
+holidays <- c('03-17' = 'St.Patricks Day', '12-31' = 'New Years Eve', '07-04' = 'Fourth of July', '12-25' = 'Christmas Day', '12-24' = 'Christmas Eve', '01-01' = 'New Years Day')
+speed_violations$Holiday = holidays[speed_violations$Month_Day]
+speed_violations <- mutate(speed_violations, Holiday = ifelse(is.na(Holiday), 'No holiday', Holiday))
+
+```
+
+Reading in a file that contains information about the type of each camera (park vs. school) and when each camera went live
+```{r}
+chicago_active_cameras <- read_csv("chicago_active_cameras.csv", col_types = cols(`Citation Live` = col_date(format = "%m/%d/%Y"), `Warning Live` = col_date(format = "%m/%d/%Y"), X7 = col_skip()))
+
+chicago_active_cameras$Camera <- chicago_active_cameras$ID
+chicago_active_cameras$ID <- NULL
+chicago_active_cameras$Citation_live <- chicago_active_cameras$`Citation Live`
+chicago_active_cameras$`Citation Live` <- NULL
+chicago_active_cameras$`Warning Live`<- NULL
+chicago_active_cameras$`# of Sites` <- NULL
+chicago_active_cameras <- chicago_active_cameras %>%
+  mutate(Type = ifelse(grepl('Park', Zone), 'Park', 'School'))
+
+```
+
+Joining speed violations with camera data
+```{r, cache = TRUE}
+speed_violations_updated <- left_join(speed_violations, chicago_active_cameras, by = c('Camera' = 'Camera'))
+```
+
+Testing validity of join
+```{r}
+duplicate_rows <- speed_violations_updated %>%
+    count(Camera, Date) %>%
+    filter(n > 1)
+
+```
+
+There are `r nrow(duplicate_rows)` rows of duplicates after the join
+
+```{r}
+speed_violations_updated %>%
+  group_by(Type) %>%
+  summarise(
+    Count = n_distinct(Camera),
+    AvgViolations = mean(VIOLATIONS)
+  )
+```
+
+
+Adding a column that describes which day of the week the violations are associated with
+```{r}
+speed_violations_updated$Day = weekdays(speed_violations_updated$Date)
+
+```
+
+Writing the modified speed violations data to a new file
+```{r}
+write.csv(speed_violations_updated, 'Modified_speed_violations.csv')
+```
+
+
+
+
+
+

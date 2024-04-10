@@ -1,0 +1,443 @@
+---
+title: "Analysis of crashes near speed cameras"
+output: html_notebook
+---
+
+First loading in necessary R packages.
+```{r}
+library(tidyr)
+library(dplyr)
+library(stringr)
+library(Imap)
+library(readr)
+library(ggplot2)
+library(ggmap)
+```
+
+Crash data source: https://data.cityofchicago.org/Transportation/Traffic-Crashes-Crashes/85ca-t3if
+```{r}
+crashes <- read_csv("chi_traffic_crashes.csv")
+speed_violations <- read_csv("Modified_speed_violations.csv")
+
+```
+
+Code a new Date column in a format more usable:
+```{r}
+crashes$Date <- substring(crashes$CRASH_DATE, 1,10)
+crashes$Date <- as.Date(crashes$Date, format="%m/%d/%Y")
+```
+
+If we want to understand the effect of speed cameras on vehicles crashes, we need to look at camera(s) that we have *adequate* crash data before/after the camera(s) were live.
+
+Min crash date: 10/16/2013
+Max camera live: 08/29/2018
+
+Four cameras live after 2/21/2018: CHI173, CHI174, CHI175/176, CHI177
+All other cameras live before 12/23/2015.
+
+Per Chicago data portal:
+"Data from E-Crash are available for some police districts in 2015, but citywide data are not available until September 2017". To ensure we have adequate data, let's use the five cameras that went live in 2018 as our sample.
+```{r}
+min(crashes$Date)
+min(speed_violations$Citation_live)
+
+unique(speed_violations$Citation_live)
+```
+
+Find crashes that occurred on the same street as our sample five cameras: FOREST PRESERVE,ADDISON ST,DIVERSEY AVE, WESTERN BLVD
+
+Build an initial data set where crashes occurred on same street as cameras
+```{r}
+forest <- filter(crashes, str_detect(STREET_NAME, "FOREST PRESERVE"))
+unique(forest$STREET_NAME)
+
+addison <- filter(crashes, str_detect(STREET_NAME, "ADDISON ST"))
+unique(addison$STREET_NAME)
+
+diversey <- filter(crashes, str_detect(STREET_NAME, "DIVERSEY AVE"))
+unique(diversey$STREET_NAME)
+
+western <- filter(crashes, str_detect(STREET_NAME, "WESTERN BLVD"))
+unique(western$STREET_NAME)
+
+crashes_by_cameras <- rbind(forest,addison,diversey,western)
+```
+Use street address column to add a column for the closest camera to each crash
+```{r}
+crashes_by_cameras <- mutate(crashes_by_cameras, ClosestCamera = ifelse(str_detect(STREET_NAME, "FOREST PRESERVE"), "CHI174", ifelse(str_detect(STREET_NAME, "ADDISON ST"), "CHI175", ifelse(str_detect(STREET_NAME, "DIVERSEY AVE"), "CHI177", ifelse(str_detect(STREET_NAME, "WESTERN BLVD"), "CHI173", "N/A")))))
+```
+
+Summarize our speed_violations df to get supplementary information about each camera to be used later.
+```{r}
+cameras_summary <- speed_violations %>%
+  group_by(Camera) %>%
+  filter(row_number()==1)%>%
+  summarise(
+    Camera = Camera,
+    Address = Address,
+    Type = Type,
+    Latitude = LATITUDE,
+    Longitude = LONGITUDE,
+    Live = Citation_live
+  )
+```
+
+Double checking we don't have any null cameras
+```{r}
+unique(crashes_by_cameras$ClosestCamera)
+```
+Join info about each camera to our crash data set.
+```{r}
+crashes_by_cameras_t <- left_join(crashes_by_cameras, cameras_summary, by = c("ClosestCamera" = "Camera"))
+```
+
+Create new column for distance from crash to camera.
+```{r}
+crashes_by_cameras_t <- mutate(crashes_by_cameras_t, Distance = gdist(LONGITUDE,LATITUDE,Longitude,Latitude, units = "miles"))
+```
+
+Code a new Date column in a format more usable:
+```{r}
+crashes_by_cameras_t$Date <- substring(crashes_by_cameras_t$CRASH_DATE, 1,10)
+crashes_by_cameras_t$Date <- as.Date(crashes_by_cameras_t$Date, format="%m/%d/%Y")
+```
+
+Create new column indicating if crash occurred before camera was live or not:
+```{r}
+crashes_by_cameras_t <- mutate(crashes_by_cameras_t, CameraLive = ifelse(Date >= Live, 1, 0))
+```
+
+Validate that cameras are facing the direction that the crash was facing:
+
+https://data.cityofchicago.org/Transportation/Speed-Camera-Locations/4i42-qv3h
+
+Data shows direction cameras are facing. Since all cameras (except 175/176) have both directions monitored with cameras, we don't have to worry about which direction the crash was. Digging into where 175/176 are located, they are actually across the street from each other so we don't need to consider which directions the crashes were by these cameras either. For simplicity sake, we'll consider 175/176 the "same" camera.
+
+CHI173 - NB and SB
+CHI177 - WB and EB
+CHI174 - EB and WB
+CHI175 - EB
+CHI176 - WB
+
+```{r}
+ggplot(crashes_by_cameras_t, aes(x=Distance))+
+  geom_histogram()
+```
+
+Let's use a quarter mile as a cutoff for a crash to be considered "near" a camera
+```{r}
+crashes_by_cameras_close <- filter(crashes_by_cameras_t, Distance <= 0.25)
+```
+
+Let's transform our data set so we have an observational variable "Crashes". We'll aggregate crashes for each date/camera.
+Before: each row represented a crash
+After: each row represents a Date, Camera pair with aggregated # of crashes that occurred that date.
+```{r}
+crashes_by_cameras_close_sum <- crashes_by_cameras_close %>%
+  group_by(Date,ClosestCamera,CameraLive) %>%
+  summarise(
+    Crashes=n(),
+  ) %>%
+  ungroup()
+
+# Validate that there aren't any duplicate Camera, Date pairs
+crashes_by_cameras_close_sum %>%
+  group_by(Date,ClosestCamera) %>%
+  summarise(
+    num = n()
+  ) %>%
+  arrange(desc(num))
+```
+Each row currently only shows dates where a crash actually occurred. We want to "fill" in the missing dates in our dataset.
+```{r}
+# 2072 total days in that time frame, we should have 5432 total data points once we fill in dates without any crashes
+difftime(min(crashes_by_cameras_close_sum$Date), max(crashes_by_cameras_close_sum$Date))
+
+# We'll use the complete function to fill in dates where we didn't have any crashes for each camera. These will have 0 crashes on those days.
+camera_crashes <- complete(crashes_by_cameras_close_sum, Date = seq.Date(min(crashes_by_cameras_close_sum$Date), max(crashes_by_cameras_close_sum$Date), by="day"), ClosestCamera)
+
+# Validating that we don't have duplicates
+camera_crashes %>%
+  group_by(ClosestCamera,Date) %>%
+  summarise(
+    num = n()
+  ) %>%
+  arrange(desc(num))
+
+# filling in NAs for Crashes column
+camera_crashes <- mutate(camera_crashes, Crashes = ifelse(is.na(Crashes), 0, Crashes))
+
+# Setting first values in data set for CameraLive so fill function will work correctly
+camera_crashes$CameraLive[1:4] <- 0
+
+# Making sure each Camera's live date is filled in so fill function will work properly
+camera_crashes$CameraLive[camera_crashes$Date == "2018-02-21" & camera_crashes$ClosestCamera == "CHI173"] <- 1
+
+camera_crashes$CameraLive[camera_crashes$Date == "2018-08-29" & camera_crashes$ClosestCamera %in% c("CHI174", "CHI175","CHI177")] <- 1
+
+# fill in the NAs for the CameraLive column
+camera_crashes <- camera_crashes %>%
+  group_by(ClosestCamera) %>%
+  fill(CameraLive) %>%
+  ungroup()
+```
+
+```{r}
+# Building a crash month column off of the date column for random sampling
+camera_crashes$Month <- substr(camera_crashes$Date,6,7)
+
+camera_crashes$CameraLive <- as.factor(camera_crashes$CameraLive)
+
+camera_crashes$Month <- as.factor(camera_crashes$Month)
+```
+
+
+Per Chicago data portal:
+"Data from E-Crash are available for some police districts in 2015, but citywide data are not available until September 2017". Let's make the start of our sample be 9-2017 so we don't skew our dataset
+```{r}
+t <- camera_crashes %>%
+  filter(ClosestCamera != "CHI173", Date < "2018-08-29") %>%
+  mutate(Timeframe = ifelse(Date <= "2017-09-01", "Before September 2017", "After September 2017"))
+
+meancrashes <- t %>%
+  group_by(Timeframe) %>%
+  summarise(
+    Mean = mean(Crashes)
+  )
+
+ggplot(data=t,aes(x=Crashes))+
+  geom_density(aes(color=Timeframe))
+
+```
+
+Filter our dataset so we only have data past 9/1/2017
+```{r}
+camera_crashes_t <- camera_crashes %>%
+  filter(Date >= "2017-09-01")
+```
+
+Let's build a MonthYear column for potential use later.
+```{r}
+camera_crashes_t$Year <-substr(camera_crashes_t$Date,1,4)
+camera_crashes_t$Month <- as.character(camera_crashes_t$Month)
+camera_crashes_t$MonthYear <- paste(camera_crashes_t$Year,"-",camera_crashes_t$Month,"-01",sep="")
+camera_crashes_t$MonthYear <- as.Date(camera_crashes_t$MonthYear)
+```
+
+Let's visualize how monthly aggregate crashes near speed cameras have changed over time.
+```{r}
+camera_crashes_month <- camera_crashes_t %>%
+  group_by(MonthYear, Month) %>%
+  summarise(
+    Crashes = sum(Crashes)
+  ) %>%
+  ungroup()
+
+ggplot(data=camera_crashes_month, aes(x=MonthYear,y=Crashes))+
+  geom_line(aes(group=1), color="firebrick2")+
+  geom_vline(aes(xintercept=as.Date("2018-09-01")), color = "grey40", linetype = "dashed")+
+  geom_vline(aes(xintercept=as.Date("2018-03-01")), color = "grey40", linetype = "dashed")+
+  geom_text(aes(x=as.Date("2018-09-01"), y=20,label="CHI 174-177 live"), color="grey40")+
+  geom_text(aes(x=as.Date("2018-03-01"), y=5, label="CHI 173 live"), color="grey40")+
+  scale_x_date(name = "Month")
+ 
+```
+
+I want to see what the current "mix" of our dataset is pre/post camera live.
+```{r}
+t <- camera_crashes_t %>%
+  group_by(Month,CameraLive)%>%
+  summarise(
+    Frequency = n()
+  ) 
+
+s <- camera_crashes_t %>%
+  group_by(CameraLive)%>%
+  summarise(
+    c=n()
+  )
+
+a <- left_join(t,s,by="CameraLive")
+
+a$perc <- a$Frequency/a$c*100
+
+ggplot(data=a, aes(x=Month, y=perc))+
+  geom_bar(aes(fill=CameraLive), stat="identity", position = "dodge")
+
+```
+Sample data points for each (Month, Camera) group. This should ensure we have an even spread of cameras/months in our sample.
+```{r}
+d1 <- camera_crashes_t %>% 
+  filter(CameraLive == 0, ClosestCamera != "CHI173") %>% 
+  group_by(Month,ClosestCamera) %>% 
+  sample_n(28)
+
+d2 <- camera_crashes_t %>% 
+  filter(CameraLive == 1, ClosestCamera != "CHI173") %>% 
+  group_by(Month, ClosestCamera) %>% 
+  sample_n(31)
+
+new_df <- rbind(d1,d2)
+
+
+t <- new_df %>%
+  group_by(Month,CameraLive)%>%
+  summarise(
+    Frequency = n()
+  ) 
+
+s <- new_df %>%
+  group_by(CameraLive)%>%
+  summarise(
+    c=n()
+  )
+
+a <- left_join(t,s,by="CameraLive")
+
+a$perc <- a$Frequency/a$c*100
+
+# let's see what it looks like for cameras too
+c <- new_df %>%
+  group_by(ClosestCamera,Month,CameraLive)%>%
+  summarise(
+    Frequency = n()
+  ) 
+
+d <- new_df %>%
+  group_by(CameraLive)%>%
+  summarise(
+    c=n()
+  )
+
+e <- left_join(c,d,by="CameraLive")
+
+e$perc <- e$Frequency/e$c*100
+
+e <- e %>%
+  group_by(ClosestCamera, CameraLive) %>%
+  summarise(
+    Percent = sum(perc)
+  )
+# Let's see our sample mix for months
+ggplot(data=a, aes(x=Month, y=perc))+
+  geom_bar(aes(fill=CameraLive), stat="identity", position = "dodge")
+
+# Let's see our sample mix for cameras
+ggplot(data=e, aes(x=ClosestCamera, y=Percent))+
+  geom_bar(aes(fill=CameraLive), stat="identity", position = "dodge")
+```
+```{r}
+d1_173 <- camera_crashes_t %>% 
+  filter(CameraLive == 0, ClosestCamera == "CHI173") %>% 
+  group_by(Month,ClosestCamera) %>% 
+  sample_n(20)
+
+d2_173 <- camera_crashes_t %>% 
+  filter(CameraLive == 1, ClosestCamera == "CHI173", !(Month %in% c("03","04","05","06","07","08"))) %>%
+  group_by(Month, ClosestCamera) %>% 
+    sample_n(31)
+
+new_df_173 <- rbind(d1_173,d2_173)
+```
+
+Let's grab sample means before/after cameras are live.
+```{r}
+new_df %>%
+  group_by(ClosestCamera,CameraLive) %>%
+  summarise(
+    AvgCrashes = mean(Crashes)
+  )
+
+new_df_173 %>%
+  group_by(ClosestCamera,CameraLive) %>%
+  summarise(
+    AvgCrashes = mean(Crashes)
+  )
+
+new_df <- rbind(new_df,new_df_173)
+new_df %>%
+  group_by(ClosestCamera,CameraLive) %>%
+  summarise(
+    AvgCrashes = mean(Crashes)
+  )
+```
+
+Ideally I'd like to do a formal test of significance between the two samples (e.g. t test). The density plot, however, shows that our data is clearly not normally distributed.
+```{r}
+ggplot(data=new_df, aes(x=Crashes))+
+  geom_density(aes(fill=CameraLive),alpha=0.3)
+```
+If we aggregate by month, our crashes resemble something closer to a normal distribution.
+```{r}
+new_df_month <- new_df %>%
+  filter(ClosestCamera %in% c("CHI177","CHI175","CHI174")) %>%
+  group_by(MonthYear, CameraLive) %>%
+  summarise(
+    Crashes = sum(Crashes)
+  ) %>%
+  ungroup()
+
+before <- filter(new_df_month, CameraLive == 0)
+after <- filter(new_df_month, CameraLive ==1)
+
+ggplot(data=before)+
+  geom_density(aes(x=Crashes),fill="tomato1",alpha=0.3)+
+  geom_density(data=after,aes(x=Crashes),fill="seagreen3",alpha=0.3)
+
+res <- t.test(before$Crashes,after$Crashes)
+res
+```
+```{r}
+lm <- lm(Crashes~CameraLive, data = camera_crashes_t)
+summary(lm)
+```
+
+Exploring Poisson distribution:
+```{r}
+bpois <- rpois(n=1000, lambda = mean(filter(new_df, CameraLive==0)$Crashes))
+hist(bpois)
+bpoisdf <- data.frame(bpois)
+
+ggplot(data=bpoisdf)+
+  geom_density(aes(x= bpois))+
+  geom_density(data=before, aes(x=Crashes),color="tomato1",alpha=0.25)
+```
+
+Time series decomposition:
+```{r}
+crashes_ts <- ts(camera_crashes_month$Crashes, frequency = 12)
+crashes_ts
+crashes_decompose <- decompose(crashes_ts)
+plot(crashes_decompose)
+```
+
+```{r}
+res <- data.frame(Residual = crashes_decompose$random)
+plot(crashes_decompose$random)
+mean(crashes_decompose$random, na.rm = "TRUE")
+checkresiduals(crashes_decompose$random)
+ggplot()+
+  geom_density(data=res, aes(x=Residual), fill="tomato1")
+```
+
+
+Another visual showing where crashes occurred by cameras.
+```{r}
+register_google(google_key)
+map <- get_map(location = c(lon=-87.72499, lat=41.93171), zoom=16, maptype='roadmap', source='google')
+
+```
+
+Visualize crashes at the CHI177 camera:
+```{r}
+crashes_by_cameras_close$CameraLive <- as.factor(crashes_by_cameras_close$CameraLive)
+
+ggmap(map)+
+  geom_point(data = filter(crashes_by_cameras_close, ClosestCamera == "CHI177", CRASH_MONTH == 7, Date > "2017-09-01", substring(Date,1,4) %in% c("2018","2019")), aes(x=LONGITUDE, y=LATITUDE, fill=CameraLive), size=3.5, shape = 24, color = "black")+
+  geom_point(data = filter(cameras_summary, Camera=="CHI177"), aes(x=Longitude,y=Latitude), fill = "Yellow", color = "black", size = 7, shape = 23)+
+  geom_label(data = filter(cameras_summary, Camera=="CHI177"), aes(x=Longitude,y=Latitude, label=Camera),vjust=-1)+
+  theme(axis.title = element_blank(),
+            axis.ticks = element_blank(),
+            axis.text = element_blank())
+```
+
